@@ -13,7 +13,7 @@ horapha --output_base=/tmp/ob info
 On top of that, it adds two commands that are *not* forwarded to bazel:
 
 ```
-horapha checkpoint [bazel startup flags...]
+horapha checkpoint --stop [bazel startup flags...]
 horapha restore    [bazel startup flags...]
 ```
 
@@ -57,6 +57,11 @@ loopback (see below).
 `checkpoint`/`restore` take the same bazel *startup* flags as a normal
 invocation. Images live under `$output_base/criu/`.
 
+The guarded restore path currently requires a fresh `checkpoint --stop`. It
+records the stopped process tree's PID range so the new init and CRIU helpers
+cannot occupy IDs that the saved JVM needs. Leave-running checkpoints do not
+include that bound and cannot yet be restored by this prototype.
+
 ### Resolving the output_base
 
 horapha replicates bazel's own algorithm to find the `output_base`, so you
@@ -83,6 +88,8 @@ inside the namespace, driven by the init**:
   `criu dump --leave-running`. The checkpointed namespace-local pid is recorded
   in `criu/ns-pid`. Pass `--stop` to dump and then tear the server down
   (`horapha checkpoint --stop`), e.g. to free resources or to test restore.
+  With `--stop`, the namespace is torn down even if capture fails; do not use
+  the failed checkpoint. Without `--stop`, the server remains running.
 - `horapha restore` launches `criu restore` as the foreground command of a fresh
   namespace; the init adopts the restored server and persists.
 - **Auto-restore:** an ordinary `horapha` command (e.g. `build`) with no running
@@ -122,7 +129,9 @@ libraries stay file-backed and CRIU dumps them normally.
 
 - Linux with unprivileged user namespaces enabled
   (`sysctl kernel.unprivileged_userns_clone=1` on some distros).
-- `criu` >= 3.18 on `$PATH` (4.x recommended for `--unprivileged`).
+- A CRIU build for which `criu check --feature clone3_set_tid --unprivileged`
+  succeeds. Restore must allocate saved task IDs without resetting the namespace's
+  automatic PID allocator.
 - A bazel built with the `JniLoader` patch above (point `HORAPHA_BAZEL` at it).
 
 ## Configuration
