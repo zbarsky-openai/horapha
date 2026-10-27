@@ -189,8 +189,8 @@ cd ~/my/workspace        # a dir under a MODULE.bazel / WORKSPACE
 # output_base is derived like bazel does, so no --output_base needed.
 horapha build //...
 
-# snapshot it (the server keeps running; add --stop to tear it down too)
-horapha checkpoint
+# snapshot and stop this server so the guarded restore path can use it
+horapha checkpoint --stop
 
 # ...later (even after the processes are gone), bring it back
 horapha restore
@@ -207,8 +207,8 @@ derived location.
 
 ## Status
 
-This is a research experiment. The full cycle works end-to-end: a warm
-namespaced server can be checkpointed, the machine state thrown away, restored
-(automatically, on the next command), and a stock bazel client reattaches to the
-revived server. Rough edges remain (multi-server and cleanup edge cases are not
-hardened).
+This is a research experiment. Earlier prototypes completed checkpoint, restore,
+and client reattachment. The current lifecycle changes have Go and race-test
+coverage, but still need a fresh end-to-end restore on the published branch.
+Leave-running checkpoints are not supported by the guarded restore path;
+multi-server and cleanup edge cases also need further qualification.
