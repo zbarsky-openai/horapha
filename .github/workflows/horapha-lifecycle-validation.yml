@@ -1,0 +1,219 @@
+name: Validate published Horapha lifecycle
+'on':
+  push:
+    branches:
+    - codex/validate-horapha-lifecycle-20261027
+permissions:
+  contents: read
+jobs:
+  restore:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      HORAPHA_SOURCE: f20fc4693beceadcb477905d2259fd96f1e517fc
+      BAZEL_SOURCE: f5c522290ef9e737adc3431e2cce024fe28ef043
+      CRIU_SOURCE: ff46030c3cbd0c9cab0b7e59081370648816b4c5
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      with:
+        repository: zbarsky-openai/horapha
+        ref: f20fc4693beceadcb477905d2259fd96f1e517fc
+        path: horapha-src
+        fetch-depth: 0
+        persist-credentials: false
+    - name: Build Horapha and check unprivileged namespaces
+      working-directory: horapha-src
+      shell: bash
+      run: |
+        set -euo pipefail
+        test "$(git rev-parse HEAD)" = "$HORAPHA_SOURCE"
+        test "$(id -u)" -ne 0
+        go version
+        go build -trimpath -o "$RUNNER_TEMP/horapha" .
+        env -i PATH="$PATH" HOME="$HOME" USER="$USER" LOGNAME="$LOGNAME" RUNNER_TRACKING_ID="$RUNNER_TRACKING_ID" \
+          "$RUNNER_TEMP/horapha" namespace -- /bin/true
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      with:
+        repository: zbarsky-openai/criu
+        ref: ff46030c3cbd0c9cab0b7e59081370648816b4c5
+        path: criu-src
+        fetch-depth: 0
+        persist-credentials: false
+    - name: Build CRIU with its canonical dependencies
+      working-directory: criu-src
+      shell: bash
+      run: |
+        set -euo pipefail
+        test "$(git rev-parse HEAD)" = "$CRIU_SOURCE"
+        sudo ./contrib/dependencies/apt-packages.sh
+        make -j2 criu
+    - name: Check rootless clone3_set_tid support
+      shell: bash
+      run: |
+        set -euo pipefail
+        printf '%s\n' '#!/bin/sh' 'exec "$CRIU_BINARY" check --feature clone3_set_tid --unprivileged' > "$RUNNER_TEMP/criu-feature-check"
+        chmod +x "$RUNNER_TEMP/criu-feature-check"
+        env -i PATH="$PATH" HOME="$HOME" USER="$USER" LOGNAME="$LOGNAME" RUNNER_TRACKING_ID="$RUNNER_TRACKING_ID" \
+          CRIU_BINARY="$GITHUB_WORKSPACE/criu-src/criu/criu" HORAPHA_BAZEL="$RUNNER_TEMP/criu-feature-check" \
+          "$RUNNER_TEMP/horapha" --output_base="$RUNNER_TEMP/horapha-feature-base" version
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      with:
+        repository: zbarsky-openai/bazel
+        ref: f5c522290ef9e737adc3431e2cce024fe28ef043
+        path: bazel-src
+        fetch-depth: 0
+        persist-credentials: false
+    - name: Build optimized Bazel with JNI retention
+      working-directory: bazel-src
+      shell: bash
+      run: |
+        set -euo pipefail
+        test "$(git rev-parse HEAD)" = "$BAZEL_SOURCE"
+        curl --fail --location --retry 3 --connect-timeout 15 --max-time 120 \
+          --output "$RUNNER_TEMP/bazelisk" \
+          https://github.com/bazelbuild/bazelisk/releases/download/v1.29.0/bazelisk-linux-amd64
+        echo "5a408715e932c0250d28bd84555f12edbf70117de42f9181691c736eacc4a992  $RUNNER_TEMP/bazelisk" | sha256sum --check
+        chmod +x "$RUNNER_TEMP/bazelisk"
+        "$RUNNER_TEMP/bazelisk" --batch --nohome_rc --nosystem_rc --host_jvm_args=-Xmx4g \
+          build -c opt --jobs=2 --local_resources=memory=8192 --worker_max_instances=1 --nostamp //src:bazel
+    - name: Restore, reattach and rebuild changed input
+      shell: python
+      run: |
+        import json, os, select, shlex, signal, socket, struct, subprocess, time
+        from pathlib import Path
+
+        work = Path(os.environ["GITHUB_WORKSPACE"])
+        root = Path(os.environ["RUNNER_TEMP"]) / "horapha-smoke"
+        root.mkdir()
+        for name in ("workspace", "tmp", "cache", "java-home"):
+            (root / name).mkdir()
+        results = work / "smoke-results"
+        results.mkdir(exist_ok=True)
+        horapha = Path(os.environ["RUNNER_TEMP"]) / "horapha"
+        bazel = (work / "bazel-src/bazel-bin/src/bazel").resolve(strict=True)
+        criu = work / "criu-src/criu/criu"
+        wrapper = root / "criu-wrapper"
+        wrapper.write_text("#!/bin/sh\nif [ \"$1\" = restore ]; then\n  exec " + shlex.quote(str(criu)) +
+                           " \"$@\" --image-io-mode direct --raw-restore-workers 4\nfi\nexec " +
+                           shlex.quote(str(criu)) + " \"$@\"\n")
+        wrapper.chmod(0o700)
+        env = {k: os.environ[k] for k in ("HOME", "PATH", "USER", "LOGNAME", "LANG", "RUNNER_TRACKING_ID") if k in os.environ}
+        env.update(HORAPHA_BAZEL=str(bazel), HORAPHA_CRIU=str(wrapper), TMPDIR=str(root / "tmp"), XDG_CACHE_HOME=str(root / "cache"))
+        base = root / "output-base"
+        startup = [f"--output_base={base}", f"--output_user_root={root}/user-root", "--ignore_all_rc_files",
+                   "--host_jvm_args=-Xms32m", "--host_jvm_args=-Xmx512m", "--host_jvm_args=-XX:ActiveProcessorCount=2",
+                   "--host_jvm_args=-XX:ReservedCodeCacheSize=64m", f"--host_jvm_args=-Duser.home={root}/java-home",
+                   "--host_jvm_args=-Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts"]
+        workspace = root / "workspace"
+        (workspace / "MODULE.bazel").write_text('module(name="restore_smoke")\n')
+        (workspace / "BUILD.bazel").write_text('genrule(name="result", srcs=["input.txt"], outs=["result.txt"], cmd="cat $(location input.txt) > $@")\n')
+        (workspace / "input.txt").write_text("alpha\n")
+        owned = []
+        timings = {}
+
+        def run(name, args, limit=240):
+            print(name, flush=True)
+            started = time.monotonic()
+            with (results / (name + ".log")).open("wb") as log:
+                result = subprocess.run([str(horapha), *args], cwd=workspace, env=env,
+                                        stdout=log, stderr=subprocess.STDOUT, timeout=limit)
+            timings[name] = time.monotonic() - started
+            if result.returncode:
+                print((results / (name + ".log")).read_text(errors="replace")[-12000:])
+            result.check_returncode()
+
+        def own_init():
+            with socket.socket(socket.AF_UNIX) as sock:
+                sock.connect(str(base / "horapha.sock"))
+                pid, uid, _ = struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+                assert uid == os.getuid() and pid > 1
+                fd = os.pidfd_open(pid)
+                try:
+                    assert Path(f"/proc/{pid}/exe").resolve(strict=True) == horapha
+                    assert str(base).encode() in Path(f"/proc/{pid}/cmdline").read_bytes()
+                    assert os.stat(f"/proc/{pid}/ns/pid").st_ino != os.stat("/proc/self/ns/pid").st_ino
+                except BaseException:
+                    os.close(fd)
+                    raise
+                owned.append(fd)
+                return fd
+
+        def dead(fd, seconds=10):
+            poll = select.poll()
+            poll.register(fd, select.POLLIN)
+            return bool(poll.poll(seconds * 1000))
+
+        def identity():
+            raw = (base / "server/server_info.rawproto").read_bytes()
+            assert raw[0] == 8
+            pid = 0
+            for shift, byte in enumerate(raw[1:11]):
+                pid |= (byte & 127) << (7 * shift)
+                if not byte & 128:
+                    break
+            else:
+                raise AssertionError("unterminated PID")
+            stat = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+            assert stat[0] != "Z"
+            assert (base / "server/server.starttime").read_text().strip() == stat[19]
+            return {"pid": pid, "starttime": stat[19]}
+
+        build = [*startup, "build", "--jobs=2", "--noshow_progress", "//:result"]
+        try:
+            run("initial-build", build)
+            initial_init = own_init()
+            original = identity()
+            assert (workspace / "bazel-bin/result.txt").read_text() == "alpha\n"
+            run("idle-gc", [*startup, "info", "used-heap-size-after-gc"])
+            run("checkpoint", ["checkpoint", "--stop", *startup])
+            assert dead(initial_init), "checkpoint did not stop its owned namespace"
+            image_bytes = sum(p.stat().st_size for p in (base / "criu").rglob("*") if p.is_file())
+            assert 0 < image_bytes < 2 * 1024**3
+            run("restore", ["restore", *startup])
+            restored_init = own_init()
+            restored = identity()
+            assert restored != original
+            run("warm-build", build)
+            assert identity() == restored, "client started a replacement JVM"
+            assert (workspace / "bazel-bin/result.txt").read_text() == "alpha\n"
+            (workspace / "input.txt").write_text("bravo changed\n")
+            run("changed-build", build)
+            assert identity() == restored
+            assert (workspace / "bazel-bin/result.txt").read_text() == "bravo changed\n"
+            run("shutdown", [*startup, "shutdown"])
+            assert dead(restored_init), "shutdown left the owned namespace alive"
+            result = {"passed": True, "horapha": os.environ["HORAPHA_SOURCE"], "bazel": os.environ["BAZEL_SOURCE"],
+                      "criu": os.environ["CRIU_SOURCE"], "original": original, "restored": restored,
+                      "image_bytes": image_bytes, "timings_seconds": timings,
+                      "scope": "tiny genrule workspace; not a full-repository performance comparison"}
+            (results / "result.json").write_text(json.dumps(result, indent=2))
+            print(json.dumps(result))
+        finally:
+            try:
+                own_init()
+            except (FileNotFoundError, ConnectionRefusedError, ProcessLookupError):
+                pass
+            for fd in owned:
+                try:
+                    if not dead(fd, 0):
+                        try:
+                            signal.pidfd_send_signal(fd, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        assert dead(fd), "owned namespace survived SIGKILL"
+                finally:
+                    os.close(fd)
+            for name, path in [("criu.log", base / "criu/criu.log"), ("control.log", base / "horapha-control.log")]:
+                if path.is_file():
+                    (results / name).write_bytes(path.read_bytes()[-256 * 1024:])
+            assert sum(p.stat().st_size for p in results.iterdir() if p.is_file()) < 8 * 1024**2
+    - name: Save synthetic text results only
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: horapha-lifecycle-results
+        path: |
+          smoke-results/*.log
+          smoke-results/result.json
+        if-no-files-found: ignore
+        retention-days: 7
